@@ -1,9 +1,14 @@
-import { createAgent } from "langchain";
+import { BaseMessage, createAgent } from "langchain";
 import { ChatOllama } from "@langchain/ollama";
 import * as z from "zod";
 import { weatherTool } from "./tools";
 import { watsonPersonality } from "./prompt";
 import { appendMemory, getConversationContext } from "./rag";
+import { late } from "zod/v3";
+
+function lastItem<T>(arr: T[]): T | undefined {
+  return arr.length ? arr[arr.length - 1] : undefined;
+}
 
 const remoteModel = new ChatOllama({
   model: process.env.OLLAMA_REMOTE_MODEL,
@@ -14,10 +19,6 @@ const watsonAgent = createAgent({
   model: remoteModel,
   tools: [weatherTool],
   description: "Dr. Watson assistant with tools and short-term recall.",
-  responseFormat: z.object({
-    weather: z.string().optional(),
-    reply: z.string().describe("Watson's direct reply to the user"),
-  }),
 });
 
 export type AgentReply = {
@@ -38,13 +39,21 @@ export async function runWatsonAgent(chatId: number, message: string) {
     ],
   });
 
-  const reply =
-    result.structuredResponse?.reply ??
-    result.output ??
-    "I'm here, but I need a moment.";
+  const response = String(lastItem(result.messages)?.content);
 
-  appendMemory(chatId, { role: "user", content: message, timestamp: Date.now() });
-  appendMemory(chatId, { role: "assistant", content: reply, timestamp: Date.now() });
+  appendMemory(chatId, {
+    role: "user",
+    content: message,
+    timestamp: Date.now(),
+  });
+  appendMemory(chatId, {
+    role: "assistant",
+    content: response,
+    timestamp: Date.now(),
+  });
 
-  return { text: reply, raw: result } satisfies AgentReply;
+  return {
+    text: response,
+    raw: result,
+  } satisfies AgentReply;
 }
