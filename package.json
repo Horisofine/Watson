@@ -10,14 +10,18 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@google-cloud/local-auth": "^3.0.1",
     "@grammyjs/files": "^1.2.0",
     "@langchain/community": "^1.0.0",
     "@langchain/core": "^1.0.2",
     "@langchain/langgraph": "^1.0.1",
     "@langchain/ollama": "^1.0.0",
     "@langchain/textsplitters": "^1.0.0",
+    "googleapis": "^165.0.0",
     "grammy": "^1.38.3",
     "langchain": "^1.0.2",
+    "langfuse": "^3.38.6",
+    "langfuse-langchain": "^3.38.6",
     "unpdf": "^1.4.0"
   }
 }

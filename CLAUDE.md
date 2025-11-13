@@ -20,10 +20,14 @@ bun run index.ts
 bun install
 ```
 
-**Environment setup**: Create `.env.development` with:
+**Environment setup**: Create `.env` with:
 - `TELEGRAM_BOT_TOKEN`: Bot token from BotFather
 - `OLLAMA_REMOTE_URL`: Ollama server URL (currently 192.168.0.114:11434)
 - `OLLAMA_REMOTE_MODEL`: Model name (e.g., qwen3:8b)
+- `GOOGLE_CLIENT_ID`: Google Cloud OAuth2 client ID for Calendar API
+- `GOOGLE_CLIENT_SECRET`: Google Cloud OAuth2 client secret
+- `GOOGLE_CREDENTIALS_PATH`: Path to credentials.json (optional)
+- `CALENDAR_TOKENS_PATH`: Path to calendar tokens storage (default: ./data/calendar_tokens.json)
 
 **Important**: Always use Bun instead of Node.js, npm, or other tooling:
 - Use `bun <file>` instead of `node <file>`
@@ -43,6 +47,7 @@ bun install
 - **Embeddings**: Ollama with nomic-embed-text model
 - **Vector Store**: Custom SimpleVectorStore with JSON persistence
 - **Document Processing**: unpdf for PDF text extraction
+- **Calendar Integration**: Google Calendar API v3 with OAuth2
 - **Validation**: Zod for runtime type checking
 
 ### Data Flow
@@ -68,7 +73,10 @@ agent.ts (LangGraph StateGraph)
 ├─ tools.ts (Available tools)
 │   ├─ weather.ts
 │   ├─ searchDocuments.ts → vectorStore.ts
-│   └─ listFiles.ts → vectorStore.ts
+│   ├─ listFiles.ts → vectorStore.ts
+│   ├─ createEvent.ts → calendarService.ts
+│   ├─ listEvents.ts → calendarService.ts
+│   └─ deleteEvent.ts → calendarService.ts
 └─ rag.ts (In-memory conversation buffer)
 ```
 
@@ -85,7 +93,7 @@ vectorStore.ts (chunk & embed)
 MemoryVectorStore (with persistence to data/vectors.json)
 ```
 
-1. **Text messages**: User sends message via Telegram → Grammy bot receives in `telegram.ts` → Agent retrieves conversation context and can use `search_my_documents` tool if needed → Response sent back
+1. **Text messages**: User sends message via Telegram → Grammy bot receives in `telegram.ts` → Agent retrieves conversation history as message objects → LangGraph receives [SystemMessage, ...previousMessages, HumanMessage] → LLM processes with full structured context → Response sent back and saved to memory
 2. **File uploads**: User sends PDF/text file → Downloaded to `uploads/{userId}/` → Text extracted → Chunked (1000 chars) → Embedded using Ollama → Stored in vector database with per-user metadata
 
 ### Vision vs Reality Gap
@@ -147,6 +155,11 @@ Defines Watson's personality and behavioral guidelines:
 Re-exports all available tools:
 - `tools/weather.ts` - Mock weather tool
 - `tools/searchDocuments.ts` - RAG document search tool
+- `tools/listFiles.ts` - List user's uploaded documents
+- `tools/createEvent.ts` - Create Google Calendar events
+- `tools/listEvents.ts` - List Google Calendar events
+- `tools/deleteEvent.ts` - Delete Google Calendar events
+- `tools/finish.ts` - Mark agent task completion
 
 ### tools/searchDocuments.ts
 RAG search tool for user-uploaded documents:
@@ -190,18 +203,50 @@ Centralized embedding configuration:
 - Configurable via OLLAMA_EMBEDDING_MODEL env var
 - Shared across vector store operations
 
+### services/calendar/
+Google Calendar integration with OAuth2 authentication:
+
+**calendarTypes.ts**:
+- TypeScript interfaces for calendar operations
+- UserTokens, EventInput, EventOutput, ListEventsParams
+- ISO 8601 date/time format
+
+**calendarStorage.ts**:
+- Per-user OAuth token persistence to `data/calendar_tokens.json`
+- Token loading, saving, and validation functions
+- Bun.file() based JSON storage
+
+**calendarAuth.ts**:
+- OAuth2 flow implementation ("out of band" for desktop apps)
+- Authorization URL generation
+- Token exchange and automatic refresh
+- Token expiry handling (auto-refresh when <5 min remaining)
+
+**calendarService.ts**:
+- Google Calendar API v3 operations
+- createEvent, listEvents, deleteEvent, findEventByTitle
+- Per-user authentication with automatic token refresh
+- Timezone support (defaults to UTC)
+- Reminder configuration (popup notifications)
+
+**reminderService.ts**:
+- Background polling service (checks every 15 minutes)
+- Sends Telegram notifications for events within 30 minutes
+- Deduplication to prevent duplicate reminders
+- Automatic cleanup of old reminder tracking data
+
 ### contracts.ts
 TypeScript type definitions for Telegram API types (Chat, Message, Update).
 
 ## Memory Strategy
 
 ### Conversation Memory (rag.ts)
-In-memory sliding window for recent conversation:
-- **Storage**: JavaScript Map keyed by chat ID
-- **Window Size**: Last 20 messages per conversation
-- **Format**: Alternating user/assistant messages
-- **Lifecycle**: Ephemeral - clears on bot restart
-- **Context Injection**: Retrieved before each agent invocation
+Persistent sliding window for recent conversation:
+- **Storage**: JavaScript Map keyed by chat ID + disk persistence to `data/conversations.json`
+- **Window Size**: Last 50 messages per conversation (~25 exchanges)
+- **Format**: Proper LangChain message objects (HumanMessage/AIMessage)
+- **Lifecycle**: Persists across bot restarts via JSON file
+- **Context Injection**: Passed as structured message history to LangGraph (not as text in system prompt)
 
 ### Document Memory (vectorStore.ts)
 Persistent vector storage for uploaded documents:
@@ -227,6 +272,8 @@ Persistent vector storage for uploaded documents:
 - `/contextsize` - Display current conversation context size
 - `/listfiles` - List all uploaded documents for the current user
 - `/deletefile <filename>` - Delete a specific uploaded document and remove from vector store
+- `/calendar_auth` - Connect your Google Calendar account (initiates OAuth flow)
+- `/auth_code <code>` - Complete OAuth by providing authorization code from browser
 
 **File Upload**: Send a PDF or text file (.txt, .md, .log) to Watson via Telegram. The file will be:
 1. Downloaded to `uploads/{userId}/`
@@ -264,7 +311,7 @@ Replace the in-memory Map in `rag.ts` with database storage. The interface (`add
 
 ## Current Limitations
 
-- **Conversation memory not persistent**: Conversation history (rag.ts) lost on restart (but document vectors persist)
+- **Limited conversation window**: Only last 50 messages kept (older messages dropped without summarization)
 - **File size limit**: 20MB maximum (Telegram bot API limitation)
 - **Supported file types**: Only PDF and text files (.txt, .md, .log)
 - **No tests**: No test framework or test files
@@ -321,3 +368,72 @@ The bot uses Ollama running on a local network (192.168.0.114:11434):
 - `/listfiles` - Shows all uploaded documents
 - `/deletefile <filename>` - Removes document from storage and vector DB
 - Direct file upload - Send PDF/text file to Watson
+
+## Google Calendar Integration
+
+### Setup
+1. **Google Cloud Console**:
+   - Create project at console.cloud.google.com
+   - Enable Google Calendar API
+   - Create OAuth 2.0 credentials (Desktop app)
+   - Copy Client ID and Client Secret to `.env.development`
+
+2. **Environment Variables** (in `.env`):
+   ```bash
+   GOOGLE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
+   GOOGLE_CLIENT_SECRET="your-client-secret"
+   LANGFUSE_HOST="http://localhost:3000"
+   LANGFUSE_PUB_KEY="pk-lf-..."
+   LANGFUSE_SEC_KEY="sk-lf-..."
+   ```
+
+3. **User Authentication**:
+   - Each user must authenticate via `/calendar_auth`
+   - OAuth "out of band" flow (manual code entry)
+   - Tokens stored per-user in `data/calendar_tokens.json`
+   - Automatic token refresh when expiring
+
+### Features
+
+**Create Events**:
+- Natural language: "Schedule meeting tomorrow at 3pm for 1 hour"
+- Watson extracts: title, date/time, duration, description
+- Optional reminder notifications (popup)
+- Timezone support (defaults to UTC)
+
+**List Events**:
+- "What's on my calendar today?"
+- "Show my schedule for next week"
+- Configurable time ranges and result limits
+
+**Delete Events**:
+- "Cancel my dentist appointment"
+- Search by title or delete by event ID
+- Confirmation feedback
+
+**Reminders**:
+- Background service polls every 15 minutes
+- Sends Telegram notifications 30 minutes before events
+- Deduplication prevents duplicate reminders
+- Automatic cleanup of old tracking data
+
+### OAuth Flow
+1. User sends `/calendar_auth` in Telegram
+2. Bot replies with Google authorization URL
+3. User opens URL in browser, signs in with Google
+4. User grants calendar access permissions
+5. Google provides authorization code
+6. User sends `/auth_code <code>` to bot
+7. Bot exchanges code for access/refresh tokens
+8. Tokens stored and auto-refreshed as needed
+
+### Tools Available to Watson
+- `create_calendar_event` - Create events with title, time, description, reminders
+- `list_calendar_events` - Query events with date filters
+- `delete_calendar_event` - Remove events by ID or title search
+
+### Data Storage
+- **Tokens**: `data/calendar_tokens.json` (per-user OAuth credentials)
+- **Format**: JSON with userId keys
+- **Security**: Tokens are sensitive, ensure proper file permissions
+- **Lifecycle**: Persists across bot restarts, auto-refreshed when expiring

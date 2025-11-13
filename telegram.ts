@@ -12,6 +12,9 @@ import {
   listUserDocuments,
   removeDocumentFromVectorStore,
 } from "./vectorStore";
+import { generateAuthUrl, exchangeCodeForTokens } from "./services/calendar/calendarAuth";
+import { hasValidTokens } from "./services/calendar/calendarStorage";
+import { trackError } from "./services/errorTracking";
 
 type ThinkingPreference = Map<number, boolean>;
 
@@ -36,6 +39,7 @@ export function createTelegramBot(token: string) {
     },
     { command: "listfiles", description: "List your uploaded documents" },
     { command: "deletefile", description: "Delete an uploaded document" },
+    { command: "calendar_auth", description: "Connect your Google Calendar" },
   ]);
 
   bot.command("showthinking", async (ctx) => {
@@ -105,6 +109,51 @@ export function createTelegramBot(token: string) {
     } catch (error) {
       console.error("Error deleting file:", error);
       await ctx.reply("Sorry, I couldn't delete that file.");
+    }
+  });
+
+  bot.command("calendar_auth", async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) {
+      return ctx.reply("Could not identify user.");
+    }
+
+    // Check if already authenticated
+    if (await hasValidTokens(userId)) {
+      return ctx.reply("✅ Your Google Calendar is already connected! You can create events, list schedules, and set reminders.");
+    }
+
+    // Generate OAuth URL
+    const authUrl = generateAuthUrl();
+
+    await ctx.reply(
+      `📅 To connect your Google Calendar:\n\n` +
+      `1. Open this link in your browser:\n${authUrl}\n\n` +
+      `2. Sign in with your Google account\n` +
+      `3. Grant permission to access your calendar\n` +
+      `4. Copy the authorization code\n` +
+      `5. Send me the code with: /auth_code YOUR_CODE`
+    );
+  });
+
+  bot.command("auth_code", async (ctx) => {
+    const userId = ctx.from?.id;
+    if (!userId) {
+      return ctx.reply("Could not identify user.");
+    }
+
+    const code = ctx.message?.text?.split(" ").slice(1).join(" ").trim();
+
+    if (!code) {
+      return ctx.reply("Please provide the authorization code. Usage: /auth_code YOUR_CODE");
+    }
+
+    try {
+      await exchangeCodeForTokens(userId, code);
+      await ctx.reply("✅ Google Calendar connected successfully! You can now create events, list your schedule, and set reminders.");
+    } catch (error: any) {
+      console.error("Error exchanging auth code:", error);
+      await ctx.reply(`❌ Failed to connect calendar: ${error.message}\n\nPlease try /calendar_auth again.`);
     }
   });
 
@@ -192,72 +241,54 @@ export function createTelegramBot(token: string) {
       return ctx.reply("I only process text right now.");
     }
 
+    // Default to false if not set (thinking disabled by default)
     const showThinking = thinkingPref.get(ctx.chat.id) ?? false;
+    console.log(`[MESSAGE] Show thinking: ${showThinking}`);
     console.log("[MESSAGE] Sending to Watson agent...");
     const result = await runWatsonAgent(ctx.chat.id, text, showThinking);
 
-    console.log(`[MESSAGE] Show thinking preference: ${showThinking}`);
     console.log(`[MESSAGE] Response preview (first 200 chars): ${result.text.substring(0, 200)}`);
 
-    let reply = result.text;
-    if (!showThinking) {
-      const beforeLength = reply.length;
-
-      // Method 1: Try to filter out explicit thinking tags
-      reply = reply.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-      reply = reply.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "").trim();
-
-      // Method 2: The LLM outputs thinking paragraphs, then blank line, then actual response
-      // Look for common thinking indicators and find the last paragraph break before the response
-      const thinkingIndicators = [
-        "Okay, the user",
-        "Okay, they",
-        "I need to",
-        "I should",
-        "Let me think",
-        "The user asked",
-        "The user said",
-        "Best to respond",
-        "Alternatively,",
-        "But wait,",
-      ];
-
-      // Check if response starts with thinking
-      const startsWithThinking = thinkingIndicators.some(indicator =>
-        reply.toLowerCase().startsWith(indicator.toLowerCase())
-      );
-
-      if (startsWithThinking) {
-        // Find the last double newline, which typically separates thinking from response
-        const lastDoubleNewline = reply.lastIndexOf('\n\n');
-        if (lastDoubleNewline > 0) {
-          // Take everything after the last double newline
-          reply = reply.substring(lastDoubleNewline).trim();
-        }
-      }
-
-      if (beforeLength !== reply.length) {
-        console.log(`[MESSAGE] Filtered out chain-of-thought (${beforeLength - reply.length} chars removed)`);
-      } else {
-        console.log(`[MESSAGE] No chain-of-thought patterns found to filter`);
-      }
-    }
-
+    const reply = result.text;
     console.log(`[MESSAGE] Final reply (${reply.length} chars): ${reply.substring(0, 100)}...`);
     await ctx.reply(reply || "Nothing to report.");
   });
 
-  bot.catch((err) => {
+  bot.catch(async (err) => {
     const ctx = err.ctx;
+    const userId = ctx.from?.id;
+    const chatId = ctx.chat?.id;
+
     console.error(`Error while handling update ${ctx.update.update_id}:`);
     const e = err.error;
+
+    let errorType = "UNKNOWN_ERROR";
+    let errorMessage = String(e);
+
     if (e instanceof GrammyError) {
+      errorType = "GRAMMY_ERROR";
+      errorMessage = e.description;
       console.error("Error in request:", e.description);
     } else if (e instanceof HttpError) {
+      errorType = "HTTP_ERROR";
+      errorMessage = String(e);
       console.error("Could not contact Telegram:", e);
     } else {
       console.error("Unknown error:", e);
     }
+
+    // Track error in Langfuse
+    await trackError({
+      userId,
+      chatId,
+      errorType,
+      errorMessage,
+      stackTrace: e instanceof Error ? e.stack : undefined,
+      metadata: {
+        updateId: ctx.update.update_id,
+        updateType: Object.keys(ctx.update).filter(k => k !== "update_id")[0],
+      },
+    });
   });
 
   return bot;

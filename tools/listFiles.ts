@@ -39,7 +39,7 @@ export const listFilesTool = tool(
   {
     name: "list_my_files",
     description:
-      "List all files the user has uploaded. Use this when the user asks 'what files do I have', 'show my files', 'list my documents', or similar questions about their uploaded files.",
+      "IMMEDIATELY list all uploaded files. Use this tool RIGHT NOW whenever the user asks: 'what files do I have', 'show my files', 'list my documents', 'what did I upload', or ANY question about which files they have. DON'T respond without calling this tool first.",
     schema: z.object({}), // No parameters needed
   }
 );

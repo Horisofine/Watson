@@ -56,7 +56,7 @@ export const searchDocumentsTool = tool(
   {
     name: "search_my_documents",
     description:
-      "Search through the CONTENT of documents the user has uploaded. Use this tool when the user asks: 'what does the file contain', 'what's in my document', 'tell me about the file', 'what does it say', or any question about the CONTENT/TEXT inside their uploaded files. You MUST call this tool immediately if you say you'll check a file.",
+      "IMMEDIATELY search through the CONTENT of user's uploaded documents. Use this tool WHENEVER the user: asks what a file contains, wants to know what's in a document, asks about information from their files, or mentions searching/reading their documents. CALL THIS TOOL RIGHT NOW - don't say you'll check, just do it.",
     schema: z.object({
       query: z
         .string()

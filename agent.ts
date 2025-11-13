@@ -3,9 +3,22 @@ import { ChatOllama } from "@langchain/ollama";
 import { StateGraph, END, Annotation } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import * as z from "zod";
-import { weatherTool, searchDocumentsTool, listFilesTool } from "./tools";
+import {
+  weatherTool,
+  searchDocumentsTool,
+  listFilesTool,
+  createEventTool,
+  listEventsTool,
+  deleteEventTool
+} from "./tools";
 import { watsonPersonality } from "./prompt";
 import { appendMemory, getConversationContext } from "./rag";
+import { trackError } from "./services/errorTracking";
+
+// Simple token estimation (roughly 4 characters per token)
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
 
 // Define the state schema for our agent graph
 const AgentState = Annotation.Root({
@@ -23,13 +36,8 @@ function createOllamaModel(showThinking: boolean = false) {
     model: process.env.OLLAMA_REMOTE_MODEL,
     baseUrl: process.env.OLLAMA_REMOTE_URL,
     numPredict: -1, // No limit on tokens
+    think: showThinking, // Enable/disable thinking mode in Ollama
   };
-
-  // Some Ollama models support a "think" parameter to control reasoning output
-  // If the model doesn't support it, this will be ignored
-  if (!showThinking) {
-    config.think = false;
-  }
 
   return new ChatOllama(config);
 }
@@ -44,7 +52,8 @@ function shouldContinue(state: typeof AgentState.State): "tools" | typeof END {
     console.log(`[AGENT] Tool calls detected: ${lastMessage.tool_calls.length} tool(s)`);
     return "tools";
   }
-  // Otherwise, we stop (reply to the user)
+
+  // No tool calls means we're done - Watson has provided final response
   console.log(`[AGENT] No tool calls, ending conversation`);
   return END;
 }
@@ -60,18 +69,39 @@ async function callModel(state: typeof AgentState.State, config: { model: ChatOl
   return { messages: [response] };
 }
 
+// Tool execution node
+async function executeTools(state: typeof AgentState.State) {
+  const tools = [
+    weatherTool,
+    searchDocumentsTool,
+    listFilesTool,
+    createEventTool,
+    listEventsTool,
+    deleteEventTool
+  ];
+  const toolNode = new ToolNode(tools);
+  return await toolNode.invoke(state);
+}
+
 // Create the LangGraph workflow
 function createWatsonGraph(showThinking: boolean = false) {
   const model = createOllamaModel(showThinking);
 
   // Bind tools to the model
-  const tools = [weatherTool, searchDocumentsTool, listFilesTool];
+  const tools = [
+    weatherTool,
+    searchDocumentsTool,
+    listFilesTool,
+    createEventTool,
+    listEventsTool,
+    deleteEventTool
+  ];
   const modelWithTools = model.bindTools(tools);
 
   // Define a new graph
   const workflow = new StateGraph(AgentState)
     .addNode("agent", async (state) => callModel(state, { model: modelWithTools }))
-    .addNode("tools", new ToolNode(tools))
+    .addNode("tools", executeTools)
     .addEdge("__start__", "agent")
     .addConditionalEdges("agent", shouldContinue)
     .addEdge("tools", "agent");
@@ -92,38 +122,91 @@ export async function runWatsonAgent(
   console.log(`[AGENT] Processing message for chat ${chatId}`);
   console.log(`[AGENT] Show thinking mode: ${showThinking}`);
 
-  const context = getConversationContext(chatId);
-  const contextBlurb = context
-    ? `\n\nRecent conversation log:\n${context}`
-    : "";
+  const conversationHistory = getConversationContext(chatId);
 
-  console.log(`[AGENT] Context: ${context ? context.split("\n").length + " previous messages" : "no history"}`);
+  console.log(`[AGENT] Context: ${conversationHistory.length} previous messages`);
   console.log(`[AGENT] Invoking Watson graph with tools: weather, search_my_documents, list_my_files`);
 
   const graph = createWatsonGraph(showThinking);
   const startTime = Date.now();
 
-  // Prepare initial messages
+  // Prepare initial messages - proper message history instead of string in system prompt
   const initialMessages = [
-    new SystemMessage(watsonPersonality + contextBlurb),
+    new SystemMessage(watsonPersonality),
+    ...conversationHistory, // Include previous conversation as actual message objects
     new HumanMessage(message),
   ];
 
+  // Create Langfuse trace for this conversation
+  const { getLangfuseClient } = await import("./services/metrics");
+  const langfuseClient = getLangfuseClient();
+  let trace = null;
+  let generation = null;
+
+  if (langfuseClient) {
+    trace = langfuseClient.trace({
+      id: `chat_${chatId}_${Date.now()}`,
+      name: "watson_conversation",
+      userId: chatId.toString(),
+      sessionId: `chat_${chatId}`,
+      metadata: {
+        showThinking,
+        contextMessageCount: conversationHistory.length,
+        messagePreview: message.substring(0, 100),
+      },
+    });
+
+    generation = trace.generation({
+      name: "llm_call",
+      model: process.env.OLLAMA_REMOTE_MODEL || "unknown",
+      input: message,
+      metadata: {
+        contextMessages: conversationHistory.length,
+      },
+    });
+
+    console.log(`[METRICS] Langfuse trace created: chat_${chatId}_${Date.now()}`);
+  }
+
   // Invoke the graph
-  const result = await graph.invoke(
-    {
-      messages: initialMessages,
-      userId: chatId,
-    },
-    {
-      configurable: { thread_id: `chat_${chatId}` },
-      metadata: { userId: chatId },
+  let result;
+  try {
+    result = await graph.invoke(
+      {
+        messages: initialMessages,
+        userId: chatId,
+      },
+      {
+        configurable: { thread_id: `chat_${chatId}` },
+        metadata: { userId: chatId },
+      }
+    );
+  } catch (error: any) {
+    // End generation with error
+    if (generation) {
+      generation.end({
+        level: "ERROR",
+        statusMessage: error.message,
+      });
     }
-  );
+
+    // Track LLM errors
+    await trackError({
+      errorType: "LLM_INVOCATION_ERROR",
+      errorMessage: error.message,
+      stackTrace: error.stack,
+      userId: chatId,
+      chatId,
+      metadata: {
+        message: message.substring(0, 100),
+      },
+    });
+    throw error;
+  }
 
   const elapsed = Date.now() - startTime;
 
-  // Get the final message from the result
+  // Get the final response from the last AI message
   const finalMessage = result.messages[result.messages.length - 1];
   const response = String(finalMessage.content);
 
@@ -132,12 +215,15 @@ export async function runWatsonAgent(
 
   // Log tool calls that occurred
   const toolCalls = result.messages.filter((m: any) => m.tool_calls && m.tool_calls.length > 0);
+  const toolCallsList: string[] = [];
   if (toolCalls.length > 0) {
     console.log(`[AGENT] Tool call messages: ${toolCalls.length}`);
     toolCalls.forEach((call: any, idx: number) => {
       const tools = call.tool_calls || [];
       tools.forEach((t: any) => {
-        console.log(`[AGENT]   ${idx + 1}. ${t.name || 'unknown'}`);
+        const toolName = t.name || 'unknown';
+        console.log(`[AGENT]   ${idx + 1}. ${toolName}`);
+        toolCallsList.push(toolName);
       });
     });
   } else {
@@ -147,6 +233,38 @@ export async function runWatsonAgent(
   console.log(`[AGENT] === RAW LLM OUTPUT ===`);
   console.log(response);
   console.log(`[AGENT] === END RAW OUTPUT ===`);
+
+  // End Langfuse generation with results including token counts
+  if (generation) {
+    // Calculate full input (system prompt + all conversation messages)
+    const allInputText = initialMessages.map(m => String(m.content)).join("\n");
+    const inputTokens = estimateTokens(allInputText);
+    const outputTokens = estimateTokens(response);
+    const totalTokens = inputTokens + outputTokens;
+
+    generation.end({
+      output: response,
+      usage: {
+        input: inputTokens,
+        output: outputTokens,
+        total: totalTokens,
+      },
+      metadata: {
+        durationMs: elapsed,
+        totalMessages: result.messages.length,
+        toolCalls: toolCallsList,
+        responseLength: response.length,
+        estimatedTokens: true, // Flag to indicate these are estimates
+      },
+    });
+    console.log(`[METRICS] Generation ended. Duration: ${elapsed}ms, Tokens: ${totalTokens} (${inputTokens} in / ${outputTokens} out), Tools: ${toolCallsList.join(', ') || 'none'}`);
+  }
+
+  // Flush Langfuse trace
+  if (langfuseClient) {
+    await langfuseClient.flushAsync();
+    console.log(`[METRICS] Langfuse trace flushed`);
+  }
 
   appendMemory(chatId, {
     role: "user",
